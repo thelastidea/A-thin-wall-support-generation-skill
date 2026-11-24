@@ -10,7 +10,7 @@
     _1_whole_front.png  整件正视（沿墙法向，看窗口位置与膜的存在）
     _2_corner_front.png 角部正视（默认 26mm 视域：量缝宽、数连接件）
     _3_mid_section.png  中层剖（沿墙厚中面切开）：膜边界、缝宽、柱脚
-    _4_gap_section.png  跨缝剖（含墙厚）：膜是否居中、楔形最宽是否 ≤ 墙厚 − 2×线宽
+    _4_gap_section.png  跨缝剖（含墙厚）：膜是否居中、楔形最宽是否 ≤ 墙厚 − 线宽
 
 剖切只用 trimesh.intersections.mesh_plane（不需要 scipy / slice_mesh_plane）。
 """
@@ -290,13 +290,13 @@ def preview(stl, out_dir, normal_axis="y", up_axis="z", zoom=None):
     origin[n] = 0.5 * (lo[n] + hi[n])
     p = os.path.join(out_dir, stem + "_3_mid_section.png")
     out.append(section_2d(mesh, n, origin, p, h, u, crop=(zc, zs),
-                          title="中层剖（墙厚中面）｜上缘 4×layer、其余 3×layer"))
+                          title="中层剖（墙厚中面）｜缝宽按层高分区、受 1.5×线宽托底"))
 
     origin2 = np.zeros(3)
     origin2[h] = zc[h]
     p = os.path.join(out_dir, stem + "_4_gap_section.png")
     out.append(section_2d(mesh, h, origin2, p, u, n, crop=(zc, zs),
-                          title="跨缝剖（含墙厚）｜膜须居中、楔形最宽 ≤ 墙厚 − 2×线宽"))
+                          title="跨缝剖（含墙厚）｜膜须居中、楔形最宽 ≤ 墙厚 − 线宽"))
     for p in out:
         print("写出", p)
     return out
