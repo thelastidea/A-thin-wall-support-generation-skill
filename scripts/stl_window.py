@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+#Copyright (C) 2026 thelastidea — SPDX-License-Identifier: AGPL-3.0-only
+
 """stl_window.py —— 从 STL 里抽出镂空孔边界 → 调 thinwall 引擎生成薄墙 → 布尔回网格 → 导出。
 
     python stl_window.py in.stl --out out.stl [--layer 0.08] [--lw 0.4] [--skin 0.45]
