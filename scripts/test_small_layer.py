@@ -1,3 +1,4 @@
+#Copyright (C) 2026 thelastidea — SPDX-License-Identifier: AGPL-3.0-only
 """小层高回归：0.08 / 0.12 / 0.16 / 0.2 mm 层高 × 六种异形口。
 
 为什么单独一套：默认 `layer=0.2` 的 demo-poly 覆盖不到 0.08。层高一变，三个
