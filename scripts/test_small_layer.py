@@ -1,4 +1,5 @@
-#Copyright (C) 2026 thelastidea — SPDX-License-Identifier: AGPL-3.0-only
+# -*- coding: utf-8 -*-
+# Copyright (C) 2026 thelastidea — SPDX-License-Identifier: AGPL-3.0-only
 """小层高回归：0.08 / 0.12 / 0.16 / 0.2 mm 层高 × 六种异形口。
 
 为什么单独一套：默认 `layer=0.2` 的 demo-poly 覆盖不到 0.08。层高一变，三个
@@ -49,7 +50,7 @@ def build(rings, spec, panel_w=200.0, panel_h=300.0, thick=3.0):
 
 def run_layer(layer, out_dir=None, verbose=True):
     spec = tw.WindowSpec(layer=layer, lw=0.4, skin=0.45, wall=3.0, up=(0.0, 1.0))
-    g_floor = max(spec.g0, spec.lw)
+    g_floor = spec.g0          # 缝严格按 3×层高（上缘 4×层高），不再被线宽托底
     rows, bad = [], []
     for tag, rings in shapes():
         try:
@@ -86,7 +87,7 @@ def run_layer(layer, out_dir=None, verbose=True):
 
 
 def run_too_narrow(layer=0.08):
-    """口太窄闸门：整口两侧缝之间最宽处 < min_membrane(2.0) 时**不生成**（返回空件、不报错）。
+    """口太窄闸门：整口两侧缝之间最宽处（= 净宽 − 2×缝）< min_membrane(2.0) 时**不生成**。
 
     1.2mm 窄槽在 0.6 缝下只剩 0.04 宽的膜——几何闭合、片数对，但打不出来，所以整口跳过。
     """
@@ -100,7 +101,9 @@ def run_too_narrow(layer=0.08):
         cut, fill, info = tw.window_poly(rings, 0.0, 3.0, spec=spec, axis="y")
         sk = info.get("skipped")
         mw = info.get("membrane_max", float("nan"))
-        if w < 3.2 - 1e-9:
+        # 期望值按公式算，不写死：膜 = 净宽 − 2×g0，小于 min_membrane 才该跳过
+        expect_skip = (w - 2.0 * spec.g0) < lim - 1e-9
+        if expect_skip:
             ok = (sk == "membrane_too_narrow")
             why = "按预期跳过" if ok else "该跳过却生成了"
         else:

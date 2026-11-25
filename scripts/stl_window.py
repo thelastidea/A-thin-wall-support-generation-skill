@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-#Copyright (C) 2026 thelastidea — SPDX-License-Identifier: AGPL-3.0-only
-
+# Copyright (C) 2026 thelastidea — SPDX-License-Identifier: AGPL-3.0-only
 """stl_window.py —— 从 STL 里抽出镂空孔边界 → 调 thinwall 引擎生成薄墙 → 布尔回网格 → 导出。
 
-    python stl_window.py in.stl --out out.stl [--layer 0.08] [--lw 0.4] [--skin 0.45]
+    python stl_window.py in.stl --out out.stl [--layer 0.08] [--lw 0.4] --skin 0.40
 
 流程
     1. 载入 + 合并顶点（trimesh.load(process=True, force="mesh") / merge_vertices）
@@ -612,7 +611,15 @@ def _detect_wall(mesh, clusters, face, args):
     passing = [r for r in cands
                if r["frac"] >= 0.5 and r["area"] >= max(0.01 * a_face, 4.0)]
     if passing:
-        # 面积优先：最近的平行面可能只是沉台底/凸台面，背面才是整张大面
+        # 先按面积"够像背面"筛一道，再取**最近**的那张：
+        #   · 空心壳（50×50 壳、壁 5）里，最近的平行面是腔体内壁（1600mm²，占 72%）→ T=5 正确；
+        #   · 而沉台底/凸台面往往只有背面的 1%~2%，会被这道筛掉，免得把 T 量成台阶高度。
+        # 老口径是"面积最大"，在空心壳里会一路选到远端的 50mm 大面，把 40×40 腔体整条打通。
+        near = [r for r in passing if r["area"] >= 0.25 * max(a_face, 1e-9)]
+        if near:
+            r = min(near, key=lambda q: q["T"])
+            return r["T"], ("平行面簇·最近够大(面积%.1fmm², 平面度%.2f)"
+                            % (r["area"], r["frac"])), cands
         r = max(passing, key=lambda q: (q["area"], -q["T"]))
         return r["T"], ("平行面簇(面积%.1fmm², 平面度%.2f)" % (r["area"], r["frac"])), cands
     if cands:
@@ -1013,50 +1020,101 @@ def _edge_frames(ring):
     return P, t, nout, L
 
 
+def _pt_in_ring(pt, poly):
+    """点是否在多边形内（环绕数法）。
+
+    用环绕数而不是射线交叉：射线法在「点正好落在与某条边共线的水平线附近、或与顶点
+    同高」时会数错（尖角密集的轮廓尤其容易），实测五角星孔环就踩到过——同一个点射线法
+    判「在内」、环绕数判「在外」，导致探针把有料的那一侧当成空腔。
+    """
+    x, y = float(pt[0]), float(pt[1])
+    p = np.asarray(poly, float)
+    q = np.roll(p, -1, axis=0)
+    a = np.arctan2(q[:, 1] - y, q[:, 0] - x) - np.arctan2(p[:, 1] - y, p[:, 0] - x)
+    a = (a + math.pi) % (2.0 * math.pi) - math.pi
+    return abs(float(a.sum())) > math.pi
+
+
+def _in_material(pt, polys):
+    """奇偶规则：外形环 + 内孔环一起判，落在实心里返回 True。"""
+    inside = False
+    for poly in polys:
+        if _pt_in_ring(pt, poly):
+            inside = not inside
+    return inside
+
+
+def _slice_polys(mm_rot, y):
+    """在规范系 Y=y 切一刀，返回该截面上的多边形 [(u,v)，...]。
+
+    manifold 的 slice 只沿自身 Z 轴切，所以进门前已经把 (x,y,z)->(x,z,-y) 转好，
+    这样切 z=-y 就等价于在规范系里切 Y=y，而截面坐标正好是 (u, v)。
+    """
+    try:
+        cs = mm_rot.slice(-float(y))
+    except Exception:                      # noqa: BLE001
+        return []
+    return [np.asarray(p, float) for p in cs.to_polygons() if len(p) >= 3]
+
+
 def _ceiling_probe(mesh, ring, T, up=(0.0, 1.0), oblique_deg=45.0,
-                   n_samp=16, probe_r=0.09, off=0.14, tw=None):
+                   n_samp=16, probe_r=0.09, off=0.14, tw=None, step=0.05):
     """沿 up 边采样，量「上方墙底面」离口边那张面有多深。
 
-    深度 = 从所选面（规范系 Y=0）往墙里走、第一次碰到材料的 Y。
-      · 上方墙底面和口边齐平（正常单层悬垂）→ 0；
-      · 上方墙底面比口边深（沉台/台阶/锥口）→ >0，本套薄墙支撑托不到它；
-      · 该处上方根本没有材料 → None。
-    返回 [(depth, (u,v)), ...]
+    做法：把件在规范系里沿 Y 切成若干平行截面（Y = 墙厚方向），对每个采样点
+    取「口边外侧 off 处」那一个 2D 点，看它在哪些截面上落在实心里：
+      · 上方墙底面和口边齐平（正常单层悬垂）→ 材料从 Y=0 就有，深度 0；
+      · 上方墙底面比口边深（沉台/台阶/锥口）→ 前若干个截面是空的，深度 >0；
+      · 该处上方根本没有材料 → 所有截面都空，None。
+
+    与旧版的区别：不打细柱、不做布尔求交、不猜孔环绕向，只做 2D 点在多边形内。
+    返回 [(depth, (u,v)), ...]，第三项是采样点坐标；兼容旧调用方，形状不变。
     """
-    tw = tw or _import_engine()
-    P, t, nout, L = _edge_frames(ring)
+    import manifold3d as m3
+    P_ = np.asarray(ring, float)
+    if _sarea(P_) < 0:
+        P_ = P_[::-1]
+    _, t, nout, L = _edge_frames(P_)
     cu = math.cos(math.radians(float(oblique_deg)))
     up = np.asarray(up, float)
-    sel = [i for i in range(len(P)) if float(nout[i] @ up) >= cu and L[i] > 1e-9]
+    sel = [i for i in range(len(P_)) if float(nout[i] @ up) >= cu and L[i] > 1e-9]
     if not sel:
         return []
     tot = float(sum(L[i] for i in sel))
+
+    mm = m3.Manifold(m3.Mesh(np.asarray(mesh.vertices, float), np.asarray(mesh.faces)))
+    _rot = np.array([[1.0, 0.0, 0.0, 0.0],
+                     [0.0, 0.0, 1.0, 0.0],
+                     [0.0, -1.0, 0.0, 0.0]], float)   # (x,y,z)->(x,z,-y)
+    mm_rot = mm.transform(_rot)
+    n_sec = int(max(4, min(400, round(float(T) / max(step, 1e-3)))))
+    ys = [(k + 0.5) * float(T) / n_sec for k in range(n_sec)]
+    secs = [_slice_polys(mm_rot, y) for y in ys]
+
     targets = [(k + 0.5) * tot / float(n_samp) for k in range(n_samp)]
     acc = 0.0
     out = []
     for i in sel:
-        p0 = P[i]
+        p0 = P_[i]
         while targets and acc + L[i] >= targets[0]:
             f = (targets.pop(0) - acc) / L[i]
             p = p0 + t[i] * (f * L[i])
             uv = (float(p[0]), float(p[1]))
-            best = None
-            for sgn in (+1.0, -1.0):             # 孔环绕向不定，两侧都试：落在材料里才算数
-                q = p + nout[i] * (off * sgn)
-                probe = tw.box("y", -0.25, float(T) + 0.25,
-                               q[0] - probe_r, q[0] + probe_r,
-                               q[1] - probe_r, q[1] + probe_r)
-                try:
-                    inter = trimesh.boolean.intersection([mesh, probe], engine="manifold")
-                except Exception:                # noqa: BLE001
-                    inter = None
-                if inter is None or len(getattr(inter, "faces", [])) == 0:
-                    continue
-                ys = np.asarray(inter.vertices)[:, 1]
-                cand = (float(np.min(ys)), float(np.max(ys)))
-                if best is None or cand[0] < best[0]:
-                    best = cand
-            out.append((None, None, uv) if best is None else (best[0], best[1], uv))
+            # 两侧都试：孔环绕向不定，_edge_frames 的 nout 对孔环可能指向孔内
+            qp = p + nout[i] * float(off)
+            qm = p - nout[i] * float(off)
+            fp = [_in_material(qp, polys) for polys in secs]
+            fm = [_in_material(qm, polys) for polys in secs]
+            if not any(fp) and not any(fm):
+                out.append((None, None, uv))
+                continue
+            flags = fp if sum(fp) >= sum(fm) else fm
+            k0 = flags.index(True)
+            k1 = k0
+            while k1 + 1 < len(flags) and flags[k1 + 1]:
+                k1 += 1
+            half = 0.5 * float(T) / n_sec
+            out.append((max(0.0, ys[k0] - half), min(float(T), ys[k1] + half), uv))
         acc += L[i]
     return out
 
@@ -1170,6 +1228,12 @@ def run(args):
         print("[定墙厚] T=%.3fmm（%s）" % (T, wall_how))
     if T <= 0:
         raise SystemExit("墙厚 %.3f 不成立" % T)
+    if args.skin is None:
+        raise SystemExit("必须给膜厚 --skin（这个参数没有默认值）：按打印机/用途定，"
+                         "线宽 0.4 时建议 0.40（1 圈）或 0.80（2 圈）；"
+                         "Classic 墙生成器下用整圈数。例：--skin 0.40")
+    if args.skin <= 0:
+        raise SystemExit("--skin 必须是正数")
     if T < args.skin:
         raise SystemExit("墙厚 %.3fmm < skin %.3fmm：这面墙比薄墙还薄，放不下膜。"
                          "改 --skin 或换面" % (T, args.skin))
@@ -1233,8 +1297,12 @@ def run(args):
         else:
             print("[规整] 环合并（不做薄壁删除）：环 %d→%d、轮廓 %d→%d、材料面积 %.2f mm²"
                   % (reg["rings_before"], reg["rings_after"], reg["contours_before"],
-                     reg["area_after"]))
+                     reg["contours_after"], reg["area_after"]))
         loops = loops2
+        if merge_tol > 1e-9 and reg["contours_after"] != reg["contours_before"]:
+            merge_warn.append("薄壁合并把尖角削出了倒角（轮廓 %d→%d）：后续判窄可能误伤，"
+                              "尖角件请用 --merge-thin 0"
+                              % (reg["contours_before"], reg["contours_after"]))
         if merge_tol > 1e-9 and reg["dropped"] > 0.02:
             merge_warn.append("已把薄于 %.2fmm 的残留壁当不存在（删 %.2fmm²）"
                               % (merge_tol, reg["dropped"]))
@@ -1267,9 +1335,11 @@ def run(args):
     # ---------- 6. 引擎参数 ----------
     kwargs = dict(layer=args.layer, lw=args.lw, skin=args.skin, wall=float(T),
                   up=(0.0, 1.0), flare=not args.no_flare,
-                  max_wall=float(args.max_wall), top_clear=float(args.top_clear))
-    if args.max_wall and float(T) >= float(args.max_wall) - 1e-9:
-        print("[跳过] 墙厚 T=%.3fmm ≥ 上限 %.3fmm：厚墙不需要薄墙支撑（一处悬垂只在薄壁上加一套），"
+                  max_wall=float(args.max_wall), top_clear=float(args.top_clear),
+                  tip_clamp_layers=int(args.tip_clamp_layers),
+                  tip_blunt=float(args.tip_blunt), tip_blunt_deg=float(args.tip_blunt_deg))
+    if args.max_wall and float(T) > float(args.max_wall) + 1e-9:
+        print("[跳过] 墙厚 T=%.3fmm > 上限 %.3fmm：厚墙不需要薄墙支撑（一处悬垂只在薄壁上加一套），"
               "不导出。要强行生成请 --max-wall 0。" % (float(T), float(args.max_wall)))
         raise SystemExit(1)
     if args.span_max is not None:
@@ -1516,13 +1586,25 @@ def build_parser():
     ap.add_argument("--no-split-pinch", action="store_true",
                     help="不做瓶颈剪除：孔环上净距 < 2×上缘缝+线宽 的窄颈不被弦切开，"
                          "这类孔会被引擎整体拒绝")
-    ap.add_argument("--merge-thin", type=float, default=None, metavar="MM",
-                    help="把薄于该厚度的残留壁当不存在（默认 1.2×线宽；0 = 只合并重叠环、不删材料）")
-    ap.add_argument("--skin", type=float, default=0.45, help="薄墙厚 mm（默认 0.45）")
+    ap.add_argument("--merge-thin", type=float, default=0.0, metavar="MM",
+                    help="把薄于该厚度的残留壁当不存在（**默认 0 = 不删材料**，只合并重叠环）。"
+                         "给正值是形态学开运算，会在 36° 这类尖角上削出细小倒角（实测 0.058），"
+                         "尖角件务必留 0；只有确实有薄于 1.2×线宽 的残留壁且不需要保尖角时才开")
+    ap.add_argument("--skin", type=float, default=None,
+                    help="膜厚 mm（生成薄墙时必填、没有默认值：每次按打印机/用途定；"
+                         "建议 lw~2×lw，Classic 墙生成器用整圈数 0.40 / 0.80）")
     ap.add_argument("--max-wall", type=float, default=5.0,
                     help="墙厚上限 mm（默认 5.0）：量到的墙厚 ≥ 该值就不做薄墙支撑，直接不导出；0 = 关掉这条闸门")
     ap.add_argument("--top-clear", type=float, default=0.16, metavar="MM",
                     help="上缘张开柱顶端离上方墙面的间隙 mm（默认 0.16，写死；0 = 柱端埋进墙 embed）")
+    ap.add_argument("--tip-clamp-layers", type=int, default=1, metavar="N",
+                    help="尖角横桥占几个层高（默认 1；2~3 更保险，桥高 = N×layer）")
+    ap.add_argument("--tip-blunt", type=float, default=0.8, metavar="MM",
+                    help="膜的尖角钝化宽度：内角特别尖的膜尖会被削成这么宽的平口"
+                         "（默认 0.8 = 2 条 0.4 线宽；尖角处每层放不下一条线，切片器会丢掉）。"
+                         "给 0 关掉钝化、保留原来的尖尖。")
+    ap.add_argument("--tip-blunt-deg", type=float, default=70.0, metavar="DEG",
+                    help="内角小于该值（默认 70°）的膜角才钝化；90° 直角本来就能打、不处理，圆滑曲线的离散顶点也不受影响。")
     ap.add_argument("--wall", type=float, default=None,
                     help="覆盖自动检测的墙厚 mm（默认自动）")
     ap.add_argument("--face-normal", default="auto",
@@ -1556,7 +1638,28 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
-    return run(args)
+    raw = list(argv) if argv is not None else list(sys.argv[1:])
+    try:
+        return run(args)
+    except SystemExit as e:
+        msg = "" if isinstance(e.code, int) or e.code is None else str(e.code)
+        # 自动定面挑的是「面积最大的平面」。一件上有好几张平行面时，孔常常在面积稍小的那张上
+        # （例如 50mm 立方壳：五角星开在 +Y 面 2212mm²，而 ±X/±Y 的素面各 2500mm²）。
+        # 这种「自动面上没孔」的情况就挨个换面再试，别让使用者先去读 --list-faces。
+        if (args.face_sel is None and args.face_normal in (None, "auto", "")
+                and "没有找到面积" in msg and not args.dry_run):
+            for i in range(1, 8):
+                print("\n[自动] 面积最大的那张面上截不到孔，换 --face-sel %d 再试 ……" % i)
+                try:
+                    return run(build_parser().parse_args(raw + ["--face-sel", str(i)]))
+                except SystemExit as e2:
+                    m2 = "" if isinstance(e2.code, int) or e2.code is None else str(e2.code)
+                    if "越界" in m2:
+                        break
+                    if "上限" in m2:
+                        raise                      # 墙厚闸门这类真结论，不要挨个面重试
+                    continue
+        raise
 
 
 if __name__ == "__main__":
