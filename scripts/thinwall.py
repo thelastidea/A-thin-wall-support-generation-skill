@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import dataclasses
 from dataclasses import dataclass
 
 import numpy as np
@@ -105,7 +106,7 @@ def _av_prism(axis, u0, u1, prof):
         faces.append([i, j, n + j])
         faces.append([i, n + j, n + i])
     m = trimesh.Trimesh(V, np.array(faces), process=True)
-    if m.volume < 0:
+    if _vol(m) < 0:
         m.invert()
     return m
 
@@ -129,7 +130,7 @@ def _au_prism(axis, v0, v1, prof):
         faces.append([i, j, n + j])
         faces.append([i, n + j, n + i])
     m = trimesh.Trimesh(V, np.array(faces), process=True)
-    if m.volume < 0:
+    if _vol(m) < 0:
         m.invert()
     return m
 
@@ -182,7 +183,7 @@ def post_wedge(axis, a0, a1, u0, u1, v_root, v_edge, v_tip, grow,
         faces.append([i, j, n + j])
         faces.append([i, n + j, n + i])
     m = trimesh.Trimesh(V, np.array(faces), process=True)
-    if m.volume < 0:
+    if _vol(m) < 0:
         m.invert()
     return m
 
@@ -216,7 +217,7 @@ def _prism(axis, a0, a1, poly_uv):
         faces.append([i, j, n + j])
         faces.append([i, n + j, n + i])
     m = trimesh.Trimesh(V, np.array(faces), process=True)
-    if m.volume < 0:
+    if _vol(m) < 0:
         m.invert()
     return m
 
@@ -235,7 +236,7 @@ def _loft(axis, v0, v1, q0, q1):
         faces.append([i, j, 4 + j])
         faces.append([i, 4 + j, 4 + i])
     m = trimesh.Trimesh(V, np.array(faces), process=True)
-    if m.volume < 0:
+    if _vol(m) < 0:
         m.invert()
     return m
 
@@ -352,6 +353,21 @@ def add(mesh, parts):
     return trimesh.boolean.union([mesh] + parts, engine="manifold")
 
 
+# ---------- 体积取值 ----------
+
+def _vol(obj):
+    """体积（mm³）。**trimesh 的 `Trimesh.volume` 是属性，manifold3d 的 `Manifold.volume()` 是方法。**
+
+    两种对象在同一段代码里混用；一旦把 trimesh 的结果当 manifold 调 `.volume()`，就会抛
+    `TypeError: 'numpy.float64' object is not callable` —— 而且如果整段被 `except` 包着，
+    会变成"静默不生效"（本项目踩过：张开柱裁剪整整半天没跑）。统一走这里取值。
+    """
+    v = getattr(obj, "volume", None)
+    if callable(v):
+        v = v()
+    return float(v)
+
+
 # ---------- 校验与导出 ----------
 
 def check(mesh):
@@ -369,9 +385,9 @@ def check(mesh):
     # 处偶尔会留下一层零/负体积的薄片（实测每片 −0.12 mm³），它印不出来、也不代表
     # 膜脱落。真断开的件是 5~7 mm³ 量级，不会被这个阈值吞掉。
     _tiny = 0.5
-    _keep = [p for p in _parts if p.volume() >= _tiny]      # 只有正体积才是"一块料"
+    _keep = [p for p in _parts if _vol(p) >= _tiny]      # 只有正体积才是"一块料"
     bodies = len(_keep)
-    voids = sum(1 for p in _parts if p.volume() <= -_tiny)  # 负体积 = 布尔留下的空腔壳
+    voids = sum(1 for p in _parts if _vol(p) <= -_tiny)  # 负体积 = 布尔留下的空腔壳
     crumbs = len(_parts) - bodies - voids
     F = np.asarray(mesh.faces, dtype=np.int64)
     key = np.sort(np.concatenate([F, np.roll(F, -1, axis=1)], axis=1).reshape(-1, 2), axis=1)
@@ -381,7 +397,7 @@ def check(mesh):
     return {"watertight": bool(mesh.is_watertight), "closed": holes == 0,
             "holes": holes, "nonmanifold": nonman, "bodies": bodies,
             "voids": voids, "crumbs": crumbs,
-            "vol_cm3": mesh.volume / 1000.0,
+            "vol_cm3": _vol(mesh) / 1000.0,
             "bbox": [round(float(x), 1) for x in (mesh.bounds[1] - mesh.bounds[0])]}
 
 
@@ -408,9 +424,9 @@ def _drop_inverted(mesh):
     man = m3.Manifold(m3.Mesh(vert_properties=np.asarray(mesh.vertices, dtype=np.float32),
                               tri_verts=np.asarray(mesh.faces, dtype=np.uint32)))
     comps = man.decompose()
-    if len(comps) < 2 or not any(c.volume() < 0.0 for c in comps):
+    if len(comps) < 2 or not any(_vol(c) < 0.0 for c in comps):
         return mesh
-    keep = [c for c in comps if c.volume() >= 0.0]
+    keep = [c for c in comps if _vol(c) >= 0.0]
     if not keep:
         return mesh
     out = keep[0]
@@ -433,7 +449,7 @@ def _drop_tiny(mesh, min_vol=1.0):
     comps = man.decompose()
     if len(comps) < 2:
         return mesh, 0, 1
-    keep = [c for c in comps if c.volume() >= min_vol]
+    keep = [c for c in comps if _vol(c) >= min_vol]
     dropped = len(comps) - len(keep)
     if dropped == 0:
         return mesh, 0, len(comps)
@@ -586,6 +602,8 @@ class WindowSpec:
     flare_deg: float = 30.0
     flare_wmax: float = 6.0
     min_membrane: float = 2.0   # 整口「两侧缝之间最宽的那处」小于该值就**不生成**（返回空件、不报错）。
+    membrane_min: float = 0.4   # 膜**每层那条线**的最小长度（mm）：切片里一条线短于它就印不出来。
+                                # 实现方式 = 把膜多边形上短于该值的边并掉（offset/miter 会留下 0.001 级的抖动点）。
                                 # 量法：逐段取局部净宽 W、减去两侧的缝，取最大值（欧氏距离）。
                                 # 0 = 关闭。默认 2.0：0.08 层高下缝被 1.5×线宽托底到 0.6，
                                 # 净宽 < 2 + 2×0.6 = 3.2 的口连一条 2mm 的膜都凑不出来，做了也是废片。
@@ -637,6 +655,8 @@ class WindowSpec:
     top_clear: float = 0.16         # 上缘张开柱顶端与上方墙面的间隙（mm），**写死 0.16**（使用者定版）：
                                      # 托住悬垂面但不与它熔死；层高变了它**不跟着变**；
                                      # None = 老口径 2*layer（历史行为）；0 = 柱端埋进墙 embed
+    post_clear: float = 0.0         # 张开柱**根部**离膜的净空（mm）：0 = 贴膜（柱根由 _profile 的
+                                     # s_tip 自然退进膜里）；正值 = 根部整体退开（掉件时引擎自动回退）
 
     var_gap: bool = False           # 变宽口（新月/泪滴这类两头窄中间宽的口）逐段压缝：窄端缝被压到
                                     # 可打印下限以下时，该处膜与墙粘牢（切片器会填死，等效实心），
@@ -790,15 +810,20 @@ def _chord_width(cs2, v, m, t, D, eps=2e-3):
     return max(xs) - min(xs)
 
 
+_blunt_caps = []
+
+
 def _blunt_tips(cs, spec, rings=None, g=None, warn=None):
-    """把膜上**过尖的峰**削成一段平口（默认 0.80 宽）。
+    """把膜上**过尖的峰**沿水平线削成一段平口（默认 0.80 宽）。
 
     打印机眼里膜是"一层一层的小片"：尖角处每层的宽度从 0 线性长起来，头一两毫米
-    永远放不下一条挤出线，切片器只能丢掉——看上去就是"尖角打不出来"。
+    永远放不下一条挤出线，切片器只能丢掉 —— 看着就是"尖角那块打不出来"。
 
-    做法：对每个内角 < `tip_blunt_deg` 的**孔环顶点**，沿内角平分线往膜里切一刀
-    （半平面），切完的平口宽度用实际轮廓量一遍、差多少再微调刀口位置，直到
-    平口宽度 ≈ `tip_blunt`（最多 5 次迭代）。削完每层至少 2 条线。
+    做法（用户定的口径：**切水平线，不切平分线**）：
+      · 对每个内角 < `tip_blunt_deg` 的孔环顶点，判断它朝上还是朝下；
+      · 朝下的 → 在膜上找一条**水平**线，使该高度上膜的横向宽度 ≈ `tip_blunt`，
+        把线以下的部分切掉；朝上的同理往上切。
+    水平切的好处：切面是水平面，每层轮廓一样，不产生新的斜悬垂。
 
     返回 (新 CrossSection, 削了几个角)。
     """
@@ -806,8 +831,9 @@ def _blunt_tips(cs, spec, rings=None, g=None, warn=None):
     lim = float(getattr(spec, "tip_blunt_deg", 0.0) or 0.0)
     if w <= _EPS or lim <= 0.0 or cs.is_empty() or not rings:
         return cs, 0
-    gg = float(g if g is not None else spec.g0)
+    up = _unit2(spec.up)
     n_cut = 0
+    caps = []
     for ring in rings:
         P = [(float(q[0]), float(q[1])) for q in ring]
         n = len(P)
@@ -829,48 +855,102 @@ def _blunt_tips(cs, spec, rings=None, g=None, warn=None):
             ang = math.acos(cosv)
             if ang >= math.radians(lim) or ang < 1e-3:
                 continue
-            mx, my = ua[0] + ub[0], ua[1] + ub[1]
-            lm = math.hypot(mx, my)
-            if lm < 1e-9:
+            ox, oy = -(ua[0] + ub[0]), -(ua[1] + ub[1])     # 从环内指向尖点
+            lo = math.hypot(ox, oy) or 1e-9
+            dnout = (ox / lo) * up[0] + (oy / lo) * up[1]
+            if abs(dnout) < 0.35:                            # 侧向的尖：水平切没意义
                 continue
-            m = (mx / lm, my / lm)          # 内角平分线，指向环的内部（= 孔里）
-            tt = (-m[1], m[0])
-            tα = math.tan(0.5 * ang)
-            if tα < 1e-6:
+            sgn = 1.0 if dnout < 0 else -1.0                 # 朝下切下面、朝上切上面
+            best = None
+            for _t in range(1, 161):
+                dlt = 0.05 * _t
+                yv = v[1] + sgn * dlt
+                xs = []
+                for _pl in cs.to_polygons():
+                    _n = len(_pl)
+                    for _i in range(_n):
+                        q0 = _pl[_i]
+                        q1 = _pl[(_i + 1) % _n]
+                        y0, y1 = float(q0[1]), float(q1[1])
+                        if (y0 - yv) * (y1 - yv) > 0 or abs(y1 - y0) < 1e-12:
+                            continue
+                        x = float(q0[0]) + (yv - y0) * (float(q1[0]) - float(q0[0])) / (y1 - y0)
+                        xs.append(x)
+                if len(xs) >= 2 and (max(xs) - min(xs)) >= w - 1e-9:
+                    best = yv
+                    break
+                if dlt > 8.0:
+                    break
+            if best is None:
                 continue
-            # 膜尖沿 m 离环顶点多远（用真实轮廓量）
-            dm = None
-            for _pl in cs.to_polygons():
-                for _q in _pl:
-                    _d = (float(_q[0]) - v[0]) * m[0] + (float(_q[1]) - v[1]) * m[1]
-                    if dm is None or _d < dm:
-                        dm = _d
-            if dm is None or dm < -1e-6:
+            D = best if sgn > 0 else -best
+            mm = (0.0, 1.0) if sgn > 0 else (0.0, -1.0)
+            tt = (-mm[1], mm[0])
+            cs2 = _cut_cs(cs, (0.0, 0.0), mm, tt, D)
+            if cs2 is None:          # 切失败（几何退化）：跳过这一刀，别让后续崩
                 continue
-            D = dm + (0.5 * w) / tα
-            ok = None
-            for _it in range(5):
-                cs2 = _cut_cs(cs, v, m, tt, D)
-                if cs2 is None or cs2.is_empty() or cs2.num_contour() != cs.num_contour():
-                    break
-                ww = _chord_width(cs2, v, m, tt, D)
-                if ww is None:
-                    break
-                if abs(ww - w) <= 0.06 * w:
-                    ok = cs2
-                    break
-                D += (w - ww) / (2.0 * tα) if tα > 1e-6 else 0.0
-                if not (0.0 <= D <= dm + 10.0 * w + 5.0):
-                    break
-            if ok is None:
+            if cs2 is None or cs2.is_empty() or cs2.num_contour() != cs.num_contour():
                 continue
-            cs = ok
+            cs = cs2
             n_cut += 1
+            if sgn < 0:      # 朝上的平口（顶端被削）：记下来补一根小托
+                _xs = []
+                for _pl in cs.to_polygons():
+                    _n = len(_pl)
+                    for _i in range(_n):
+                        q0 = _pl[_i]
+                        q1 = _pl[(_i + 1) % _n]
+                        y0, y1 = float(q0[1]), float(q1[1])
+                        if (y0 - best) * (y1 - best) > 0 or abs(y1 - y0) < 1e-12:
+                            continue
+                        _xs.append(float(q0[0]) + (best - y0) * (float(q1[0]) - float(q0[0])) / (y1 - y0))
+                if len(_xs) >= 2:
+                    caps.append((min(_xs), max(_xs), best, v[0], v[1]))
     if n_cut and warn is not None:
         warn.append(("钝化尖角", n_cut,
-                     "把 %d 个内角 < %.0f° 的膜尖削成 %.2f 宽的平口（尖角处每层放不下一条 %.2f 的挤出线）；"
-                     "该处膜不铺到尖，缺口是刻意留的" % (n_cut, lim, w, spec.lw)))
+                     "把 %d 个内角 < %.0f° 的膜尖沿**水平线**削成 %.2f 宽的平口（尖角处每层放不下一条 "
+                     "%.2f 的挤出线）；该处膜不铺到尖，缺口是刻意留的" % (n_cut, lim, w, spec.lw)))
+    cs = cs
+    _blunt_caps[:] = list(caps)
     return cs, n_cut
+
+
+def _simplify_cs(cs, tol, warn=None, tag="膜"):
+    """把多边形上短于 tol 的边并掉：切片里一条线短于 tol 就印不出来。
+
+    offset/miter 会在拐角留下 0.001~0.07 级的抖动点（实测五角星膜 22 点里 11 条边 <0.4），
+    它们在切片里是零长度段。逐点走：与「上一个保留点」距离 < tol 就丢弃。
+    """
+    if tol is None or tol <= _EPS:
+        return cs, 0
+    n0 = cs.num_contour()
+    out, dropped = [], 0
+    for poly in cs.to_polygons():
+        pts = [(float(p[0]), float(p[1])) for p in poly]
+        if len(pts) < 3:
+            continue
+        keep = [pts[0]]
+        for p in pts[1:]:
+            if math.hypot(p[0] - keep[-1][0], p[1] - keep[-1][1]) >= tol:
+                keep.append(p)
+        if len(keep) >= 3 and math.hypot(keep[0][0] - keep[-1][0],
+                                         keep[0][1] - keep[-1][1]) < tol:
+            keep.pop()
+        dropped += len(pts) - len(keep)
+        if len(keep) >= 3:
+            out.append(keep)
+    if not out:
+        return cs, 0
+    try:
+        sec = m3.CrossSection(out, m3.FillRule.NonZero)
+    except Exception:
+        return cs, 0
+    if sec.is_empty() or sec.num_contour() != n0:
+        return cs, 0          # 并多了、拓扑变了 → 不并（宁可留抖动点）
+    if warn is not None and dropped > 0:
+        warn.append(("%s线并短边" % tag, dropped,
+                     "并掉 %d 个短于 %.2fmm 的抖动点，否则切片里会出现零长度段" % (dropped, tol)))
+    return sec, dropped
 
 
 def _min_residual(rings, spec, g_used, fv):
@@ -1035,7 +1115,7 @@ def _check_too_narrow(rings, spec, fv, g_used):
             gi, gj = segs[i][3], segs[j][3]
             if max(gi, gj) <= g_used + _EPS:              # 两边同宽 → 交给 _shrink
                 continue
-            need = gi + gj + spec.lw
+            need = gi + gj + spec.membrane_min
             d = _seg_dist(segs[i][0], segs[i][1], segs[j][0], segs[j][1])
             if d < need - 1e-9 and (worst is None or d - need < worst[0]):
                 worst = (d - need, d, gi, gj)
@@ -1043,9 +1123,9 @@ def _check_too_narrow(rings, spec, fv, g_used):
         _, d, gi, gj = worst
         raise ValueError(
             "离顶部过窄：口内有两条相对的边只隔 %.3f，各留缝 %.3f / %.3f 后中间只剩 %.3f，"
-            "小于最小残留膜宽 lw=%.3f。这段膜会被 offset 整条抹掉、片数却不变（静默漏膜）。"
-            "把该处净宽放宽到 ≥ %.3f（= 两缝 + lw），或设 flare=False 让该段与其余段同宽。"
-            % (d, gi, gj, d - gi - gj, spec.lw, gi + gj + spec.lw))
+            "小于最小残留膜宽 membrane_min=%.3f。这段膜会被 offset 整条抹掉、片数却不变（静默漏膜）。"
+            "把该处净宽放宽到 ≥ %.3f（= 两缝 + membrane_min），或设 flare=False 让该段与其余段同宽。"
+            % (d, gi, gj, d - gi - gj, spec.membrane_min, gi + gj + spec.membrane_min))
 
 
 def _offset_ring(pts, shift, lim):
@@ -1412,6 +1492,10 @@ def _stations(ring, spec, fv, g_used, m0, m1, warn):
         w = {"up": w_up, "down": w_dn, "side": w_sd}[z]
         if L < 1e-6:
             continue
+        # 上缘张开柱：段太短时按段长收窄，否则 2.0/2.6 宽的楔形会从段端**越过拐角钻进墙里**
+        # （用户 五角星件 实测："张开柱最下方贴到了墙面"就是这个）。
+        if z == "up" and not (z == "down"):
+            w = min(w, max(0.6, L - 2.0 * spec.embed))
         g = spec.gap_zone(z)
         # 判 link 的起膜边（朝下、落差 ≤ 2×lw）：改为「段两端各一颗柱 + 中间按 start_gap 铺」。
         # 柱的方向按**打印轴**定，不跟该处缝法向走：下缘柱一律竖直（⊥ 水平面）、
@@ -1467,6 +1551,7 @@ def _stations(ring, spec, fv, g_used, m0, m1, warn):
 
     # ── 第二遍：布点 ──
     raw = []
+    _up_clamped = []      # 被「两端不许超出所在那段膜」收窄过的张开柱宽度
     for (a0, a1, z, w, g, link, n_run, d_s, d_e, _i0, _i1), kf, kl in zip(plan, keep_first, keep_last):
         L = a1 - a0
         if link:
@@ -1508,7 +1593,18 @@ def _stations(ring, spec, fv, g_used, m0, m1, warn):
             if z == "side" and (spec.rib_snap or w <= spec.layer + 1e-9):
                 # 侧片默认只有一个层高厚：柱心压到层带中心，切片里才真正落在同一层
                 s = _snap_side_s(ring, cum, s, spec, up, a0, a1, w, d_s, d_e)
-            raw.append((s % cum[-1], w, g, 0.0, z == "up", z, {"down": "up", "side": "side"}.get(z, "seam")))
+            w_s = w
+            if z == "up":
+                # 张开柱的两端不许超出「膜在该层的位置」：柱占的弧长区间
+                # [s−w/2, s+w/2] 必须落在本条膜段的 [a0, a1] 之内，否则按剩余
+                # 长度收窄（不够一个线宽就整颗不放）。
+                _room = 2.0 * min(s - a0, a1 - s)
+                if _room < w_s:
+                    w_s = _room
+                    _up_clamped.append(w_s)
+                if w_s < max(0.6, spec.lw):
+                    continue
+            raw.append((s % cum[-1], w_s, g, 0.0, z == "up", z, {"down": "up", "side": "side"}.get(z, "seam")))
     # 角格留空（尖角/凹角）必须按弧长再滤一遍：keep_first/keep_last 只管**区段**两端，
     # 同一区段内部拐过去的角（如星形两条斜边都是 side、中间夹着尖角/凹角）管不到，
     # 实测会有 0.2 宽的片正好落在角上、端面插进墙里。判据：件端面到角点的弧长距离 < tack。
@@ -1603,6 +1699,10 @@ def _stations(ring, spec, fv, g_used, m0, m1, warn):
         else:
             out.append(item)
 
+    if _up_clamped:
+        warn.append(("上缘柱两端收窄", len(_up_clamped),
+                     "%.2f..%.2f 宽（柱两端不许超出所在那段膜）"
+                     % (min(_up_clamped), max(_up_clamped))))
     # 首尾同点（闭合轮廓的 s=0 与 s=L）合并
     if len(out) > 1 and abs(out[-1][0] - cum[-1]) < max(1e-4, 0.02):
         f, l = out[0], out[-1]
@@ -1639,7 +1739,7 @@ def _sweep_prof(prof, pt, n, t, w):
         faces.append([i, j, npt + j])
         faces.append([i, npt + j, npt + i])
     m = trimesh.Trimesh(np.array(V, dtype=float), np.array(faces), process=True)
-    if m.volume < 0:
+    if _vol(m) < 0:
         m.invert()
     return m
 
@@ -1655,10 +1755,14 @@ def print_risk(spec, fv=None):
     fill_line = spec.gap_fill
     floor = spec.slot_min
     g0 = spec.g0
-    for name, g in (("其余段", g0), ("上缘", spec.gap_up if spec.flare else g0)):
+    _zones = [("下柱缝（3×层高）", spec.gap_zone("down"))]
+    if spec.flare:
+        _zones.append(("侧边/上缘缝", spec.gap_zone("side")))
+    for name, g in _zones:
         if g < spec.lw - 1e-9:
             out.append("缝宽不可打印：%s缝 %.3f < 线宽 %.3f —— 连一条挤出线都放不下，切片器必然"
-                       "把缝填实，膜会和墙连成一块（把 gap_side / gap_min 抬到 ≥ %.2f）"
+                       "把缝填实，膜会和墙连成一块（这条缝要真留出来，得换更细的喷嘴/线宽，"
+                       "或把 gap_min 抬到 ≥ %.2f）"
                        % (name, g, spec.lw, max(floor, spec.lw)))
         elif g < floor - 1e-9:
             out.append("缝宽窄于可打印下限：%s缝 %.3f < %.3f，切片器会把缝当薄壁"
@@ -1682,9 +1786,10 @@ def print_risk(spec, fv=None):
                   spec.post_b, g0, spec.embed, spec.start_gap))
     _tc = _top_clear(spec)
     if _tc and _tc < spec.layer - 1e-9:
-        out.append("顶隙太小：上缘张开柱顶端离墙面只有 %.3fmm（< 一层高 %.3f），支撑会和上方"
-                   "悬垂面熔在一起、拆的时候带掉墙皮；建议 2 层（%.3f）"
-                   % (_tc, spec.layer, 2.0 * spec.layer))
+        out.append("顶隙提醒：上缘张开柱顶端离墙面 %.3fmm，小于一层高 %.3f（0.08 层高下是 2 层，"
+                   "层高变大后就不是了）：切片器会把这一格当薄壁/桥处理，拆的时候可能带掉墙皮，"
+                   "**看一遍切片预览**%s"
+                   % (_tc, spec.layer, "；要更保险就换小层高" if spec.layer > 0.08 else ""))
     return out
 
 
@@ -1742,6 +1847,15 @@ def start_plan(rings, spec, fv, g_used, bridge_max=None, z_distance=None):
                     ln, bridge_max, bridge_max)
             out.append((i, round(ln, 2), round(ang, 1), round(z, 3), act, why))
     return out
+
+
+def _post_clear(spec):
+    """张开柱根部离膜的净空：None → 2 个层高；显式值原样；0 → 老口径。"""
+    v = getattr(spec, "post_clear", 0.0)
+    if v is None:
+        return 2.0 * float(spec.layer)
+    return max(0.0, float(v))
+
 
 
 def _top_clear(spec):
@@ -1858,7 +1972,7 @@ def _spans(st, total, spec=None):
     return out
 
 
-def window_poly(rings, a_lo, a_hi, spec=None, axis="z"):
+def window_poly(rings, a_lo, a_hi, spec=None, axis="z", _no_gap=False):
     """异型口：返回 (cut_parts, fill_parts)。
 
     rings : 口的平面闭合折线列表（第 0 条为外环，其余为内环/岛），坐标是 (u, v)
@@ -1948,11 +2062,11 @@ def window_poly(rings, a_lo, a_hi, spec=None, axis="z"):
                          "窄口把缝从 %.2f 收到 %.2f（< 1.5×线宽 %.2f）：膜保住了，但这些缝会被"
                          "切片器间隙填充并死，等于膜在该处与墙粘牢" % (spec.g0, g_used, spec.slot_min)))
         _w_min = _min_residual(rings, spec, g_used, fv)
-        if _w_min is not None and _w_min < spec.lw - 1e-6:
+        if _w_min is not None and _w_min < spec.membrane_min - 1e-6:
             warn.append(("残留膜过窄", round(_w_min, 3),
-                         "窄处把缝收到 %.2f 后，最窄那片膜只剩 %.3f 宽（< 线宽 %.3f）：几何闭合、"
-                         "片数对，但切片器打不出比线宽更薄的一片，实际会断/塌。把该处净宽放到 "
-                         "≥ %.3f，或设 gap_floor 更小让缝再收窄" % (g_used, _w_min, spec.lw,
+                         "窄处把缝收到 %.2f 后，最窄那片膜只剩 %.3f 宽（< membrane_min %.3f）：几何闭合、"
+                         "片数对，但打不出一片比这更薄的膜，实际会断/塌。把该处净宽放到 "
+                         "≥ %.3f，或设 gap_floor 更小让缝再收窄" % (g_used, _w_min, spec.membrane_min,
                                                                   _w_min + 2 * g_used)))
 
         if spec.flare:
@@ -1963,11 +2077,33 @@ def window_poly(rings, a_lo, a_hi, spec=None, axis="z"):
                 raise ValueError(
                     "加宽后膜不成立（轮廓 %d → %s 片，应保持 %d 片）：上缘缝 4×layer=%.3f 等于"
                     "在膜边再往里切 %.3f，该处局部净宽需 ≥ g_used(%.3f) + 4×layer(%.3f) + 最小残留膜宽"
-                    "（建议 ≥ lw=%.3f）；否则设 flare=False（上缘与其他段同宽 3×layer），或放宽该处净宽。"
+                    "（建议 ≥ membrane_min=%.3f）；否则设 flare=False（上缘与其他段同宽 3×layer），或放宽该处净宽。"
                     % (n_expect, 0 if membrane_cs.is_empty() else membrane_cs.num_contour(),
-                       n_expect, fv["gap"], fv["gap"] - g_used, g_used, fv["gap"], spec.lw))
+                       n_expect, fv["gap"], fv["gap"] - g_used, g_used, fv["gap"], spec.membrane_min))
 
+    _blunt_caps[:] = []
     membrane_cs, _n_blunt = _blunt_tips(membrane_cs, spec, rings, g_used, warn)
+    membrane_cs, _n_simp = _simplify_cs(membrane_cs, getattr(spec, 'membrane_min', 0.0), warn)
+    # 朝上的平口（钝化出来的顶端横边）：它太短，`_stations` 的"短区段清理"会把它并进
+    # 侧边段，结果那里一颗柱都没有 —— 用户看到的"最上面整个尖角的连接件打不出来"。
+    # 这里直接补一根小托：宽 = 平口宽 + 两侧各咬 0.1，上端停在离墙 top_clear 处。
+    _caps = []
+    for _u0, _u1, _v, _au, _av in list(_blunt_caps):
+        # 顶端平口上面的墙是**一个 V 形尖**：直着往上会顶到尖点，方板会从 V 的两侧
+        # 戳出去变成两块悬空的角。所以小托做成**收尖梯形**：底 = 平口 + 两侧各咬 0.1，
+        # 顶收成 0.2，停在离尖点 top_clear 处 —— 两侧正好贴着 V 的两条斜面。
+        _vt = _av - max(_top_clear(spec), 0.30)
+        if _vt - _v <= 1e-6:
+            continue
+        _poly = [(_u0 - spec.embed, _v), (_u1 + spec.embed, _v),
+                 (max(_au + 0.10, _u1 - 0.05), _vt), (min(_au - 0.10, _u0 + 0.05), _vt)]
+        if _sarea(_poly) < 0:
+            _poly.reverse()
+        _caps.append(_poly)
+        warn.append(("尖角平口补托", _v, _u1 - _u0,
+                     "顶端平口 %.2f 宽，太短排不出标准柱：补一块收尖的小托（底 %.2f、顶 0.20，"
+                     "上端离尖点 %.2f），贴住上方墙的 V 形斜面" % (
+                         _u1 - _u0, _u1 - _u0 + 2 * spec.embed, _av - _vt)))
 
     m0 = a_lo + (a_hi - a_lo - spec.skin) / 2.0
     m1 = m0 + spec.skin
@@ -1995,6 +2131,9 @@ def window_poly(rings, a_lo, a_hi, spec=None, axis="z"):
     #    搭得上（跨度 ≤ span_max、两端都落进墙料）→ 尖点 1.6mm 内不再放柱：同一处只留一套；
     #    搭不上（跨度 > span_max，横铺必垂）→ 不建桥，该处照常留柱。
     _bridges, _tip_pts = [], []
+    _n_trim = 0        # 张开柱**根部**被膜轮廓裁光、整颗不放的颗数（与 _stations 里
+                       #  `_up_clamped` 的"两端越段收窄"是两件事：后者是布点阶段按段长夹宽，
+                       #  这里是被膜轮廓切掉；两者不会对同一颗重复计数）
     if getattr(spec, "tip_clamp", False):
         _wr = [(float(q[0]), float(q[1])) for q in rings[0]]
         _mp = membrane_cs.to_polygons()
@@ -2059,6 +2198,8 @@ def window_poly(rings, a_lo, a_hi, spec=None, axis="z"):
                              "span_max %.2f，两端都锚在墙料上、不悬垂；尖点 %.1fmm 内不再放柱。"
                              % (_chord + 2.0 * _emb, _hl, _lyr, _emb, _chord, spec.span_max, 1.6)))
 
+    # 膜的打印方向最低点：张开柱的柱根一律裁到它以上，绝不在 z 上探出膜的下沿
+    _vmin_mem = min(min(_p[1] for _p in _poly) for _poly in membrane_cs.to_polygons())
     for poly in membrane_cs.to_polygons():
         ring = [(float(p[0]), float(p[1])) for p in poly]
         n = len(ring)
@@ -2110,6 +2251,7 @@ def window_poly(rings, a_lo, a_hi, spec=None, axis="z"):
                 # 再放柱只会让 2.0 宽的柱伸出窄缝、被膜裁成悬空小块 → 这里干脆不放柱。
                 n_narrow = n_narrow + 1
                 continue
+            s_near_v = None
             if ax == "up":                # 下缘柱：竖直（⊥ 水平面），朝墙 = −up
                 nrm, t = (-up[0], -up[1]), (hz[0], hz[1])
                 cosv = abs(nrm[0] * seam[0] + nrm[1] * seam[1])
@@ -2128,15 +2270,46 @@ def window_poly(rings, a_lo, a_hi, spec=None, axis="z"):
             else:                          # 上缘张开柱：跟着该处缝的坡走
                 nrm, t = seam, (-seam[1], seam[0])
                 # flare_tack>0：末端停在离墙面该值处（不咬墙，弱连接）；=0：照旧埋进墙 embed
-                if spec.tack:
-                    s_end = (d_hit - spec.tack) if d_hit is not None else (g - spec.tack)
-                elif _top_clear(spec):
-                    # 托的顶端停在离上方墙面 top_clear 处：托住但不与悬垂面熔死
-                    _tc = _top_clear(spec)
-                    s_end = ((d_hit - _tc) if d_hit is not None
-                             else (g - _tc))
-                else:
-                    s_end = (d_hit + spec.embed) if d_hit is not None else (g + spec.embed)
+                _pc = _post_clear(spec)
+                _tc = _top_clear(spec)
+                # 定死两条：①柱顶**不许**长进墙里（远端停在离墙面 top_clear 处）；
+                # ②顶隙固定 0.16（0.08 层高下正好 2 层）。柱根默认与膜面共面，不往膜里压。
+                # 柱根：只许咬进膜 0.02（够布尔融合，又不会在膜面以下长出可见的料）；
+                # post_clear>0 时才显式退到膜面外。
+                # 定死：柱根**不许**再往膜里退（老口径 s_tip 会退进膜 0.6~2.95，
+                # 切片上看就是"柱穿到膜下面"）——楔形放不下就按可用坡长收窄，不退。
+                s_near_v = _pc if _pc > _EPS else None
+                s_end = ((d_hit - _tc) if d_hit is not None else (g - _tc))
+                if s_end - (s_near_v if s_near_v is not None else 0.0) < 0.20:
+                    n_narrow = n_narrow + 1        # 缝太窄，柱子只剩薄片：不放
+                    continue
+            if ax == "seam":
+                # 柱子两端必须落在"这一层的膜"上：沿口边方向不许超出膜的走线范围，
+                # 但两侧（墙厚方向）可以凸出。放不下就把宽度收窄（不删柱）。
+                _memp = [_dedupe(r) for r in membrane_cs.to_polygons()]
+
+                def _in_mem(pt2):
+                    inside = False
+                    for _poly in _memp:
+                        q = list(_poly)
+                        n = len(q)
+                        for k in range(n):
+                            x1, y1 = q[k]
+                            x2, y2 = q[(k + 1) % n]
+                            if ((y1 > pt2[1]) != (y2 > pt2[1])) and \
+                                    (pt2[0] < (x2 - x1) * (pt2[1] - y1) / (y2 - y1 + 1e-12) + x1):
+                                inside = not inside
+                    return inside
+
+                _w0 = float(w)
+                while _w0 > max(0.45, spec.lw):
+                    _e1 = (pt[0] + 0.5 * _w0 * t[0], pt[1] + 0.5 * _w0 * t[1])
+                    _e2 = (pt[0] - 0.5 * _w0 * t[0], pt[1] - 0.5 * _w0 * t[1])
+                    if _in_mem(_e1) and _in_mem(_e2):
+                        break
+                    _w0 *= 0.85
+                if _w0 < float(w) - 1e-9:
+                    w = _w0          # 静态收窄（布点阶段先夹一次，更细的由逐层求交处理）
             if ax == "side" and spec.rib_t:
                 # 侧边薄墙片只取 rib_t 厚，居中放在墙厚中面上（默认与膜同厚）
                 cc = 0.5 * (m0 + m1)
@@ -2144,14 +2317,67 @@ def window_poly(rings, a_lo, a_hi, spec=None, axis="z"):
                 r1 = cc + 0.5 * spec.rib_t
                 prof = [(0.0, r0), (0.0, r1), (s_end, r1), (s_end, r0)]
             else:
-                prof, s_tip = _profile(spec, fv, g, extra, flare, m0, m1, s_end=s_end)
+                prof, s_tip = _profile(spec, fv, g, extra, flare, m0, m1, s_end=s_end,
+                                       s_near=s_near_v)
             if (flare and d_hit is not None and d_far is not None
                     and -s_tip > d_far - d_hit + 1e-6):
                 # 张开柱的坡根往膜里退 run−s_wide：变宽口的窄端膜只有一条线宽，
                 # 坡根会从膜的另一侧穿出去、被裁成悬空小块（负体积）→ 这颗柱不放。
                 n_narrow = n_narrow + 1
                 continue
-            bld.append([_sweep_prof(prof, pt, nrm, t, w), ax != "seam"])
+            _piece = _sweep_prof(prof, pt, nrm, t, w)
+            if ax == "seam":
+                # 张开柱的投影不许长出窗口开口（否则根部会伸到膜外/墙里变成悬空片）
+                try:
+                    _ow = max(1.0, 0.5 * float(fv["w_top"]))
+                    _op = _poly_solid([_dedupe(r) for r in rings], m0 - _ow, m1 + _ow)
+                    # 只裁到"窗口开口"内：柱子跨过缝、把上方墙撑住（顶端停在 s_wide，离墙 0.16）。
+                    # 再按「膜轮廓外偏 s_end」的平面范围裁一刀：柱子两端不许超出膜在该层的位置，
+                    # 超出的部分（靠近尖角/窄段时的那点斜角）直接切掉并记一笔。
+                    # 柱子沿 s=0（膜的外表面）切两段分别裁：
+                    #   · 埋在膜里的那段（s<0）只许长在**膜自己的轮廓内**——x 方向不许比膜多出一点
+                    #     （用户 327~337 层实测：肩角处的坡根伸到膜外面）；
+                    #   · 缝里那段（s>0）只裁到窗口开口内，跨缝托墙的部分保留。
+                    _s_lo = min(float(q[0]) for q in prof)
+                    _grow_tot = max(float(q[1]) for q in prof) - m1
+                    _h0 = 0.0
+                    if _s_lo < -1e-6 and float(s_end) > _s_lo + 1e-9:
+                        _h0 = _grow_tot * (0.0 - _s_lo) / (float(s_end) - _s_lo)
+                    # 膜里那段的允许范围 = **膜轮廓本身**（外偏 0）：柱根不许探出膜
+                    _pz_mem = _poly_solid([_dedupe(r) for r in membrane_cs.to_polygons()],
+                                          m0 - 2.5, m1 + 2.5)
+                    # 两段必须重叠 0.1（s ∈ [-0.05, +0.05] 两段都有），否则切开后接不上
+                    _ov, _wr = 0.05, min(float(w), max(0.30, m1 - m0))
+                    _grp = []
+                    if _s_lo < -1e-6:
+                        # 根段：s ∈ [s_tip, +0.05]，宽度只取膜厚（膜的走线宽度），
+                        # 平面范围只许在膜轮廓内；两侧（墙厚方向）不限
+                        _pr = [(_s_lo, m0), (_s_lo, m1), (_ov, m1 + _h0), (_ov, m0 - _h0)]
+                        # 宽度不按整根柱子静态收窄：让它在**每一层**都与该层的膜求交，
+                        # 结果自动随该层膜的形状变（层与层不同）。
+                        _root = _sweep_prof(_pr, pt, nrm, t, w)
+                        _root = trimesh.boolean.intersection([_root, _pz_mem], engine="manifold")
+                        if _vol(_root) > 1e-6:
+                            _grp.append(_root)
+                        else:
+                            _n_trim += 1          # 根部整个落在膜外面：这颗不放
+                    # 缝段：s ∈ [-0.05, s_end]，沿边宽 2.0，只裁到窗口开口内（跨缝托墙）
+                    _s0 = (0.0 - _ov) if _s_lo < -1e-6 else 0.0
+                    _h_ov = _h0 + (_grow_tot - _h0) * (_ov / max(1e-9, float(s_end)))
+                    _pg = [(_s0, m0 - _h_ov), (_s0, m1 + _h_ov),
+                           (float(s_end), m1 + _grow_tot), (float(s_end), m0 - _grow_tot)]
+                    _gap = _sweep_prof(_pg, pt, nrm, t, w)
+                    _gap = trimesh.boolean.intersection([_gap, _op], engine="manifold")
+                    if _vol(_gap) > 1e-6:
+                        _grp.append(_gap)
+                    if not _grp:
+                        n_narrow = n_narrow + 1
+                        continue
+                    _piece = _grp[0] if len(_grp) == 1 else _union(_grp)
+                except Exception:
+                    import traceback, sys as _s
+                    traceback.print_exc(file=_s.stderr)
+            bld.append([_piece, ax != "seam"])
             n_ax[ax] = n_ax.get(ax, 0) + 1
 
     if n_narrow:
@@ -2163,7 +2389,9 @@ def window_poly(rings, a_lo, a_hi, spec=None, axis="z"):
     # 轴对齐的连接件一律按膜裁一刀：柱/片只到膜端面为止，绝不再钻进膜里
     _brects, _bmeshes, _bcent = [], [], []   # 已建的尖角桥（矩形 + 网格 + 中心），用来清掉挤在桥上的柱
     clip = [b[0] for b in bld if b[1]]
-    parts = [mem] + [b[0] for b in bld if not b[1]] + _bridges
+    # 尖角横桥单独留到最后再并：它只跟墙料咬在一起、与膜可能是"面贴面"，
+    # 若混进 parts 会被 _drop_tiny 当成碎屑（1 层高的桥只有 ~0.06mm³）删掉。
+    parts = [mem] + [b[0] for b in bld if not b[1]]
     # ── 尖角件：走“端面在膜端点、侧面不跨过膜”的路子，两种形态（`tip_mode`）──
     #   strut（默认口径，使用者指定“用一个连接件把尖角处与墙连起来”）：一根窄舌。
     #     宽 = 缝宽 g_used（=3×层高），侧面与膜的两条臂在起点相切、往外只能落进更宽的缝里，
@@ -2278,13 +2506,24 @@ def window_poly(rings, a_lo, a_hi, spec=None, axis="z"):
         conn = _union(clip)
         conn = trimesh.boolean.difference([conn, mem_clip], engine="manifold")
         parts.append(conn)
+    # 钝化平口上的小托（见上面的 _caps）
+    for _q in _caps:
+        parts.append(_poly_solid([_q], m0, m1))
+
     # 连接件与薄墙**先并成一个整体**，再把它当一片去并到面板上：
     # 这样导出的 STL 里箱体/连接处/膜是同一张闭合面，切片按一个区域排线
     _conn = _to_axis(_union(parts), axis)
     _conn, _n_tiny, _n_left = _drop_tiny(_conn)
+    if _n_trim:
+        warn.append(("柱子端头超出膜", _n_trim,
+                     "两端按膜的外偏范围裁掉（靠近尖角/窄段时会切成斜口）"))
+    if _bridges:
+        _conn = _union([_conn] + [_to_axis(b, axis) for b in _bridges])
     if _n_tiny:
         warn.append(("膜边碎屑", _n_tiny, "尖角处 %.2f 以下的小薄片已剔除（打不出来）" % 1.0))
-    if _n_left > 1:
+    if _n_left > 1 and _post_clear(spec) <= _EPS:
+        # post_clear>0 时上缘张开柱本来就只锚在墙上、与膜之间留 2 层净空，
+        # 所以"连接件与膜分成几块"是设计使然，整件的连通性另由 bodies 复核。
         warn.append(("连接件未连到膜", _n_left, "膜与连接件没有并成一片，检查该处的缝宽/窄端"))
     fill = [_conn]
 
@@ -2299,13 +2538,46 @@ def window_poly(rings, a_lo, a_hi, spec=None, axis="z"):
     if "up" in support and support["up"]["n"] == 0:
         warn.append(("上缘无柱", "上方墙首层整段没有搭接面，会整片悬垂"))
 
+    # ── 根部退开放到兜底：退开以后柱子只与墙相连，某些口型（如带岛环）的膜会失去
+    #    唯一的锚点而脱落。这里先量一次"膜+连接件"的连通块数，>1 就自动回退到压进膜里。
+    if _post_clear(spec) > _EPS and not _no_gap:
+        try:
+            # 连通性必须在「墙 + 膜 + 连接件」整件上判：柱子本来就锚在墙里，
+            # 只看膜+连接件会把所有柱当成脱落块。
+            _xs = [p[0] for r in rings for p in r]
+            _ys = [p[1] for r in rings for p in r]
+            _pad = 1.0
+            _blk = _poly_solid([[(min(_xs) - _pad, min(_ys) - _pad),
+                                 (max(_xs) + _pad, min(_ys) - _pad),
+                                 (max(_xs) + _pad, max(_ys) + _pad),
+                                 (min(_xs) - _pad, max(_ys) + _pad)]], m0, m1)
+            _cutz = [_prism("z", a_lo - spec.overshoot, a_hi + spec.overshoot, r)
+                     for r in rings]
+            _nb = int(check(add(subtract(_blk, _cutz), list(parts))).get("bodies", 1))
+        except Exception as _e:      # 判连通性失败：**别当成"没问题"**，报出来当 1 块继续
+            import traceback
+            traceback.print_exc()
+            warn.append(("连通性判不了", type(_e).__name__,
+                         "整件连通性校验失败（%s），按单块继续；请人工确认 bodies" % _e))
+            _nb = 1
+        if _nb > 1:
+            _sp0 = dataclasses.replace(spec, post_clear=0.0)
+            _c0, _f0, _i0 = window_poly(rings, a_lo, a_hi, spec=_sp0, axis=axis,
+                                        _no_gap=True)
+            _i0["warn"] = list(_i0.get("warn", [])) + [
+                ("根部退开会掉件", _nb,
+                 "张开柱根部退开 %.2f 后膜与墙分成 %d 块？已自动回退到压进膜里"
+                 "（要强制退开请显式给 post_clear 并自行复核 bodies）"
+                 % (_post_clear(spec), _nb))]
+            return _c0, _f0, _i0
+
     return cut, fill, {"gap_side": g_used, "flare": fv, "warn": warn,
                        "plan": start_plan(rings, spec, fv, g_used),
                        "membrane_max": _mw_used, "support": support,
                        "conn_axes": dict(n_ax), "n_conn": len(bld), "n_wedge": n_wedge}
 
 
-def _profile(spec, fv, g, extra, flare, m0, m1, s_end=None):
+def _profile(spec, fv, g, extra, flare, m0, m1, s_end=None, s_near=None):
     """(s, a) 剖面。s 从膜边起、朝墙为正；extra>0 表示向膜内再多伸一段（并进膜里）
 
     近端向膜内多伸 spec.overlap（默认 0 = 柱顶与膜下沿齐平，共面也能被布尔并成一片）；
@@ -2318,17 +2590,27 @@ def _profile(spec, fv, g, extra, flare, m0, m1, s_end=None):
     返回 (剖面, s_tip)：s_tip 是坡根所在的 s。
     """
     e = extra + spec.overlap
+    sn = (-e) if s_near is None else float(s_near)
     s_far = g + spec.embed if s_end is None else s_end
     if flare and fv["grow"] > _EPS:
         grow = fv["grow"]
         s_wide = s_far
+        if s_near is not None:
+            # 根部已给定（贴膜）、顶端不许进墙：坡从根部按 30° 张，长度就是"根→顶"这一段，
+            # 宽度按可用长度收（达不到 w_top 就窄一点），是个停在墙前的楔形托
+            _reach = max(0.0, s_wide - sn)
+            grow = min(fv["grow"], _reach * math.tan(math.radians(spec.flare_deg)))
+            # 点序从**贴墙端 s_wide** 起，绕一圈回坡根（顺/逆时针与原来一致）
+            return ([(s_wide, m1 + grow), (s_wide, m0 - grow),
+                     (sn, m0), (sn, m1)], sn)
         s_tip = s_wide - fv["run"]
         if s_tip > -e + 1e-6:
-            return ([(-e, m0), (-e, m1), (s_tip, m1), (s_wide, m1 + grow),
-                     (s_wide, m0 - grow), (s_tip, m0)], s_tip)
+            return ([(s_wide, m1 + grow), (s_wide, m0 - grow), (s_tip, m0),
+                     (sn, m0), (sn, m1), (s_tip, m1)], s_tip)
         # 斜坡退进膜里：坡根落在膜面上，不再保留近端平直段
-        return ([(s_tip, m0), (s_tip, m1), (s_wide, m1 + grow), (s_wide, m0 - grow)], s_tip)
-    return ([(-e, m0), (-e, m1), (s_far, m1), (s_far, m0)], -e)
+        return ([(s_wide, m1 + grow), (s_wide, m0 - grow),
+                 (s_tip, m0), (s_tip, m1)], s_tip)
+    return ([(s_far, m1), (s_far, m0), (sn, m0), (sn, m1)], sn)
 
 
 # ---------- v2 自检 demo ----------

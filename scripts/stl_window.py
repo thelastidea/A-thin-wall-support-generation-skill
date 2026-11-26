@@ -128,6 +128,17 @@ def _hist_peak(vals, bin_w=None):
     return float(vals[m].mean()), int(cnt[k]), float(cnt[k]) / float(vals.size)
 
 
+def _vol(obj):
+    """体积（mm³）。trimesh 的 `Trimesh.volume` 是属性，manifold3d 的 `Manifold.volume()` 是方法。
+
+    两种对象混在一个文件里，统一走这里，避免"属性当方法调"抛 TypeError 后被 except 吞掉。
+    """
+    v = getattr(obj, "volume", None)
+    if callable(v):
+        v = v()
+    return float(v)
+
+
 def _heal(mesh):
     """修布尔输出里「位置重复的顶点」，返回 (mesh, 修掉的重复数)。
 
@@ -154,7 +165,8 @@ def _heal(mesh):
         man = m3.Manifold(m3.Mesh(
             vert_properties=np.asarray(t.vertices, np.float32),
             tri_verts=np.asarray(t.faces, np.uint32)))
-    except Exception:
+    except Exception as e:
+        print("[警告] 顶点焊接失败：%s: %s" % (type(e).__name__, e))
         return mesh, 0
     if "NoError" not in str(man.status()):
         return mesh, ndup
@@ -199,7 +211,8 @@ def _regularize(mesh, eps_mm3=0.5):
         man = m3.Manifold(m3.Mesh(
             vert_properties=np.asarray(mesh.vertices, np.float32),
             tri_verts=np.asarray(mesh.faces, np.uint32)))
-    except Exception:
+    except Exception as e:
+        print("[警告] 退化壳检查失败：%s: %s" % (type(e).__name__, e))
         return mesh, info
     if "NoError" not in str(man.status()):
         return mesh, info
@@ -209,7 +222,7 @@ def _regularize(mesh, eps_mm3=0.5):
         return mesh, info
     keep, drop = [], []
     for p in parts:
-        v = float(p.volume())
+        v = _vol(p)
         if abs(v) > eps_mm3:
             keep.append(p)
         else:
@@ -222,7 +235,8 @@ def _regularize(mesh, eps_mm3=0.5):
         mm = merged.to_mesh()
         h = trimesh.Trimesh(np.asarray(mm.vert_properties, np.float64),
                             np.asarray(mm.tri_verts, np.int64), process=False)
-    except Exception:
+    except Exception as e:
+        print("[警告] 重建拓扑失败：%s: %s" % (type(e).__name__, e))
         return mesh, info
     if len(h.faces) == 0 or not h.is_watertight:
         return mesh, info
@@ -731,8 +745,8 @@ def _section_regularize(loops, tol, tag=""):
             cs2 = cs.offset(-t, m3.JoinType.Round).offset(t, m3.JoinType.Round)
             if not cs2.is_empty():
                 cs = cs2
-        except Exception:                                     # noqa: BLE001
-            pass
+        except Exception as e:                                # noqa: BLE001
+            print("[警告] 薄壁开运算失败（跳过规整）：%s: %s" % (type(e).__name__, e))
     polys = [np.asarray(p, float) for p in cs.to_polygons()]
     info = {"rings_before": len(loops), "rings_after": len(polys),
             "depth1": len(d1), "depth2": len(d2),
@@ -1335,9 +1349,12 @@ def run(args):
     # ---------- 6. 引擎参数 ----------
     kwargs = dict(layer=args.layer, lw=args.lw, skin=args.skin, wall=float(T),
                   up=(0.0, 1.0), flare=not args.no_flare,
-                  max_wall=float(args.max_wall), top_clear=float(args.top_clear),
+                  max_wall=float(args.max_wall), top_clear=0.16,
+                  post_clear=(0.0 if args.post_clear is None
+                              else float(args.post_clear)),
                   tip_clamp_layers=int(args.tip_clamp_layers),
-                  tip_blunt=float(args.tip_blunt), tip_blunt_deg=float(args.tip_blunt_deg))
+                  tip_blunt=float(args.tip_blunt), tip_blunt_deg=float(args.tip_blunt_deg),
+                  membrane_min=float(args.membrane_min))
     if args.max_wall and float(T) > float(args.max_wall) + 1e-9:
         print("[跳过] 墙厚 T=%.3fmm > 上限 %.3fmm：厚墙不需要薄墙支撑（一处悬垂只在薄壁上加一套），"
               "不导出。要强行生成请 --max-wall 0。" % (float(T), float(args.max_wall)))
@@ -1388,6 +1405,10 @@ def run(args):
                 print("        [recess] %d 个采样点，材料区间 %s"
                       % (len(probe), ["无" if y0 is None else "%.2f..%.2f" % (y0, y1)
                                      for y0, y1, _ in probe]))
+            _ys = [y0 for y0, y1, _ in probe if y0 is not None]
+            _flat = (len(_ys) >= max(1, len(probe) // 2)
+                     and max(_ys) <= float(args.recess_tol))
+            _tc = float(args.top_clear)
             if not ok_r:
                 print("[%s] SKIP  %s" % (head, why_r))
                 for y0, y1, p in probe:
@@ -1398,7 +1419,9 @@ def run(args):
                 continue
         try:
             t1 = time.time()
-            cut, fill, info = tw.window_poly(rings, 0.0, T, spec=spec, axis="y")
+            import dataclasses as _dc
+            _spec_h = _dc.replace(spec, top_clear=_tc)
+            cut, fill, info = tw.window_poly(rings, 0.0, T, spec=_spec_h, axis="y")
             dt = time.time() - t1
         except ValueError as e:
             print("[%s] SKIP  引擎拒绝：%s" % (head, e))
@@ -1596,7 +1619,12 @@ def build_parser():
     ap.add_argument("--max-wall", type=float, default=5.0,
                     help="墙厚上限 mm（默认 5.0）：量到的墙厚 ≥ 该值就不做薄墙支撑，直接不导出；0 = 关掉这条闸门")
     ap.add_argument("--top-clear", type=float, default=0.16, metavar="MM",
-                    help="上缘张开柱顶端离上方墙面的间隙 mm（默认 0.16，写死；0 = 柱端埋进墙 embed）")
+                    help="上缘张开柱顶端离上方墙面的间隙 mm（**固定 0.16**，0.08 层高下正好 2 层）："
+                         "柱顶一律不许长进墙里，远端停在离墙面该处")
+    ap.add_argument("--post-clear", type=float, default=None, metavar="MM",
+                    help="上缘张开柱**根部**（与膜结合那一端）离膜的净空 mm；默认 2×层高"
+                         "（0.08 层高 → 0.16）。0 = 老口径（坡根压进膜里）。"
+                         "根部退开后柱子只与墙相连，若因此掉件会自动回退并报警。")
     ap.add_argument("--tip-clamp-layers", type=int, default=1, metavar="N",
                     help="尖角横桥占几个层高（默认 1；2~3 更保险，桥高 = N×layer）")
     ap.add_argument("--tip-blunt", type=float, default=0.8, metavar="MM",
@@ -1627,6 +1655,8 @@ def build_parser():
                     help="关闭「上方墙底面比口边深」检查（强行生成）")
     # 引擎参数透传（一般不用动）
     ap.add_argument("--span-max", type=float, default=None, help="上缘允许净跨 mm")
+    ap.add_argument("--membrane-min", type=float, default=0.4, metavar="MM",
+                    help="膜最窄处下限 mm（净宽 − 两侧缝），默认 0.4，不跟线宽变")
     ap.add_argument("--gap-side", type=float, default=None, help="非张开侧缝宽 mm")
     ap.add_argument("--gap-min", type=float, default=None, help="缝宽下限 mm")
     ap.add_argument("--post-w", type=float, default=None, help="上缘张开柱宽 mm")
