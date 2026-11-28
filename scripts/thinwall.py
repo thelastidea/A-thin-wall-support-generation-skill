@@ -464,9 +464,26 @@ def _drop_tiny(mesh, min_vol=1.0):
             dropped, len(keep))
 
 
-def clean_export(mesh, path):
-    """导出后重新载入校验；返回 dict（含 reload_watertight）"""
+def clean_export(mesh, path, simplify_tol=0.1):
+    """导出后重新载入校验；返回 dict（含 reload_watertight）
+
+    `simplify_tol`：导出前跑一次 `Manifold.simplify(tol)` —— 合并重合顶点、去掉零面积
+    三角形。柱根被膜轮廓布尔裁剪后，交线上会留下 0.01~0.04mm 的碎面（切片里是一段
+    走不动的短折线）；这一步把它们并掉，**体积与闭合不变**（实测 59.7282 → 59.7282）。
+    `0` 关掉。
+    """
     m = _drop_inverted(clean(mesh))
+    if simplify_tol and simplify_tol > 0:
+        try:
+            _man = m3.Manifold(m3.Mesh(vert_properties=np.asarray(m.vertices, np.float32),
+                                       tri_verts=np.asarray(m.faces, np.uint32))).simplify(simplify_tol)
+            _me = _man.to_mesh()
+            m = trimesh.Trimesh(vertices=np.asarray(_me.vert_properties)[:, :3].astype(float),
+                                faces=np.asarray(_me.tri_verts).astype(np.int64), process=False)
+        except Exception as _e:      # 简化失败就用原网格，绝不因此丢件
+            import traceback
+            traceback.print_exc()
+            print("[警告] 导出前简化失败（用原网格）：%s: %s" % (type(_e).__name__, _e))
     m.export(path)
     back = trimesh.load(path)
     info = check(back)
@@ -647,11 +664,11 @@ class WindowSpec:
                                     # 跨度 2g/cos(α/2) 超过 span_max 时退回平分线窄舌（近似竖直柱）：尖角处膜的最低点本来
                                      # 悬在缝上方、下面什么都没有（首层直接印在空中），这根舌把它钉在墙上。
                                      # 与 tip_deg 互不影响（tip_deg 管"使用者点名要尖角件"的那批）。
-    tip_blunt: float = 0.8        # 膜的尖角钝化宽度（mm）：把内角小于 tip_blunt_deg 的峰削成这么宽的平口
+    tip_blunt: float = 1.0        # 膜的尖角钝化宽度（mm）：把内角小于 tip_blunt_deg 的峰削成这么宽的平口
     tip_blunt_deg: float = 70.0   # 内角小于该值的膜角才钝化（90° 直角本来就能打，不动它）
     tip_clamp_deg: float = 80.0     # 自动搭桥判定：膜轮廓内角小于该值、且尖角朝下（角平分线与 up 夹角 >60°）
     tip_clamp_embed: float = 0.15   # 搭桥两端各咬进墙多少（横桥两端都锚在墙料上，不靠悬垂）
-    tip_clamp_layers: int = 1       # 尖角横桥占几个层高（默认 1；2~3 更保险，桥高 = layers×layer）
+    tip_clamp_layers: int = 2       # 尖角横桥占几个层高（默认 2；桥高 = layers×layer）
     top_clear: float = 0.16         # 上缘张开柱顶端与上方墙面的间隙（mm），**写死 0.16**（使用者定版）：
                                      # 托住悬垂面但不与它熔死；层高变了它**不跟着变**；
                                      # None = 老口径 2*layer（历史行为）；0 = 柱端埋进墙 embed
@@ -883,6 +900,15 @@ def _blunt_tips(cs, spec, rings=None, g=None, warn=None):
                     break
             if best is None:
                 continue
+            # 平口就是切片里的一层：把切面吸到层边界。否则切面停在两层之间，
+            # 最底那层只切到 0.0x 宽的碎段（实测 13.856 落在 13.84/13.92 之间，
+            # 首层只剩 0.044），切片器画出来就是一条打不出来的细线。
+            _L = float(getattr(spec, "layer", 0.0) or 0.0)
+            if _L > 1e-9:
+                if sgn > 0:      # 朝下切：往上收，宽度只会更大
+                    best = math.ceil(best / _L - 1e-9) * _L
+                else:            # 朝上切：往下收
+                    best = math.floor(best / _L + 1e-9) * _L
             D = best if sgn > 0 else -best
             mm = (0.0, 1.0) if sgn > 0 else (0.0, -1.0)
             tt = (-mm[1], mm[0])
@@ -951,6 +977,55 @@ def _simplify_cs(cs, tol, warn=None, tag="膜"):
         warn.append(("%s线并短边" % tag, dropped,
                      "并掉 %d 个短于 %.2fmm 的抖动点，否则切片里会出现零长度段" % (dropped, tol)))
     return sec, dropped
+
+
+def _collapse_short_edges(cs, tol, warn=None, tag="膜"):
+    """把短于 tol 的边**收成一个点**（两端取中点），不删点、不改轮廓数。
+
+    `_simplify_cs` 是"丢掉后一个点"，遇到窄颈会把这一段的轮廓数改掉而被整体放弃；
+    这里把两端并到中点，只挪 tol/2，拓扑不变，切片里那条零长度线就没了。
+    """
+    if tol is None or tol <= _EPS:
+        return cs, 0
+    n0 = cs.num_contour()
+    out, n = [], 0
+    for poly in cs.to_polygons():
+        pts = [(float(p[0]), float(p[1])) for p in poly]
+        if len(pts) < 4:
+            continue
+        a0 = abs(_sarea(pts))
+        for _ in range(400):
+            m = len(pts)
+            if m <= 3:
+                break
+            hit = -1
+            for i in range(m):
+                j = (i + 1) % m
+                if math.hypot(pts[j][0] - pts[i][0], pts[j][1] - pts[i][1]) < tol:
+                    hit = i
+                    break
+            if hit < 0:
+                break
+            j = (hit + 1) % m
+            mx = 0.5 * (pts[hit][0] + pts[j][0])
+            my = 0.5 * (pts[hit][1] + pts[j][1])
+            pts[hit] = (mx, my)
+            del pts[j]
+            n += 1
+        if len(pts) >= 3 and abs(abs(_sarea(pts)) - a0) <= 0.15 * a0 + 0.05:
+            out.append(pts)
+        else:
+            out.append([(float(p[0]), float(p[1])) for p in poly])
+    try:
+        sec = m3.CrossSection(out, m3.FillRule.NonZero)
+    except Exception:
+        return cs, 0
+    if n == 0 or sec.is_empty() or sec.num_contour() != n0:
+        return cs, 0
+    if warn is not None:
+        warn.append(("%s边收点" % tag, n,
+                     "把 %d 条短于 %.2f 的边两端并到中点（否则每层都切出一段零长度线）" % (n, tol)))
+    return sec, n
 
 
 def _min_residual(rings, spec, g_used, fv):
@@ -2092,24 +2167,35 @@ def window_poly(rings, a_lo, a_hi, spec=None, axis="z", _no_gap=False):
         # 顶端平口上面的墙是**一个 V 形尖**：直着往上会顶到尖点，方板会从 V 的两侧
         # 戳出去变成两块悬空的角。所以小托做成**收尖梯形**：底 = 平口 + 两侧各咬 0.1，
         # 顶收成 0.2，停在离尖点 top_clear 处 —— 两侧正好贴着 V 的两条斜面。
-        _vt = _av - max(_top_clear(spec), 0.30)
+        # 小托顶端也要有 ≥ membrane_min 的宽度，否则又是一条打不出来的短边：
+        # 往 V 里多退一些（0.60），顶宽取 min(0.45, 平口宽) 并夹在 V 的宽度内。
+        _vt = _av - max(_top_clear(spec), 0.60)
         if _vt - _v <= 1e-6:
             continue
+        _tw = min(0.225, 0.5 * (_u1 - _u0 + 2 * spec.embed))
         _poly = [(_u0 - spec.embed, _v), (_u1 + spec.embed, _v),
-                 (max(_au + 0.10, _u1 - 0.05), _vt), (min(_au - 0.10, _u0 + 0.05), _vt)]
+                 (max(_au + _tw, _u1 - 0.05), _vt), (min(_au - _tw, _u0 + 0.05), _vt)]
         if _sarea(_poly) < 0:
             _poly.reverse()
         _caps.append(_poly)
         warn.append(("尖角平口补托", _v, _u1 - _u0,
-                     "顶端平口 %.2f 宽，太短排不出标准柱：补一块收尖的小托（底 %.2f、顶 0.20，"
+                     "顶端平口 %.2f 宽，太短排不出标准柱：补一块收尖的小托（底 %.2f、顶 %.2f，"
                      "上端离尖点 %.2f），贴住上方墙的 V 形斜面" % (
-                         _u1 - _u0, _u1 - _u0 + 2 * spec.embed, _av - _vt)))
+                         _u1 - _u0, _u1 - _u0 + 2 * spec.embed, 2 * _tw, _av - _vt)))
 
     m0 = a_lo + (a_hi - a_lo - spec.skin) / 2.0
     m1 = m0 + spec.skin
 
     cut = [_to_axis(_prism("z", a_lo - spec.overshoot, a_hi + spec.overshoot, r), axis)
            for r in rings]
+
+    # 终版再并一次：前面的 trim / 补托 / 收窄之后，膜轮廓上又会冒出 0.03~0.08 的抖动点，
+    # 切片时每层都切出一段 < 线宽的线（用户按"膜每层每段 ≥ 0.4"验收）。
+    # 这一步放在建体之前，保证所有下游（柱、托、桥、布尔）都基于并过点的轮廓。
+    _ms, _mdrop = _collapse_short_edges(membrane_cs, max(float(spec.lw), 0.40),
+                                       warn=warn, tag="膜终版")
+    if _mdrop:
+        membrane_cs = _ms
 
     mem = _poly_solid(membrane_cs.to_polygons(), m0, m1)
     # 连接件与膜不许“对接”：`spec.fuse > 0`（= conn_fuse 或 conn_fuse_k×lw）时裁切用的膜整体内缩该值，连接件因此**穿进膜里**，
@@ -2140,7 +2226,7 @@ def window_poly(rings, a_lo, a_hi, spec=None, axis="z", _no_gap=False):
         if _mp:
             _rg = [(float(p[0]), float(p[1])) for p in _mp[0]]
             _n0 = len(_rg)
-            _lyr = max(1, int(getattr(spec, "tip_clamp_layers", 1) or 1))
+            _lyr = max(1, int(getattr(spec, "tip_clamp_layers", 2) or 2))
             _hl = _lyr * spec.layer
             _emb = float(getattr(spec, "tip_clamp_embed", 0.15))
             _cand = []

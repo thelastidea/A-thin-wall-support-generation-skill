@@ -1625,8 +1625,8 @@ def build_parser():
                     help="上缘张开柱**根部**（与膜结合那一端）离膜的净空 mm；默认 2×层高"
                          "（0.08 层高 → 0.16）。0 = 老口径（坡根压进膜里）。"
                          "根部退开后柱子只与墙相连，若因此掉件会自动回退并报警。")
-    ap.add_argument("--tip-clamp-layers", type=int, default=1, metavar="N",
-                    help="尖角横桥占几个层高（默认 1；2~3 更保险，桥高 = N×layer）")
+    ap.add_argument("--tip-clamp-layers", type=int, default=2, metavar="N",
+                    help="尖角横桥占几个层高（默认 2；桥高 = N×layer）")
     ap.add_argument("--tip-blunt", type=float, default=0.8, metavar="MM",
                     help="膜的尖角钝化宽度：内角特别尖的膜尖会被削成这么宽的平口"
                          "（默认 0.8 = 2 条 0.4 线宽；尖角处每层放不下一条线，切片器会丢掉）。"

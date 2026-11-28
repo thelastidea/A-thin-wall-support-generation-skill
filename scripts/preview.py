@@ -2,15 +2,22 @@
 # Copyright (C) 2026 thelastidea — SPDX-License-Identifier: AGPL-3.0-only
 """薄墙件的预览图（纯 numpy + PIL + matplotlib，无需 GL / scipy）
 
+可选工具：技能默认只导 STL、不自动渲染；要看形状/遮挡时才显式运行本脚本。
+
 用法：
     python scripts/preview.py part.stl --out <目录> --normal y --up z [--zoom "cx,cy,cz,size"]
+    python scripts/preview.py part.stl --out <目录> --iso [--el 115 --az -90]
 
-出四张 PNG（全部是正投影 / 剖切，不用斜视：
-3mm 薄板上斜视会被画家算法与近平行面误导，斜视请直接看切片器）：
+出四张 PNG（全部是正投影 / 剖切，遮挡由逐像素 z-buffer 判定，不是画家算法）：
     _1_whole_front.png  整件正视（沿墙法向，看窗口位置与膜的存在）
     _2_corner_front.png 角部正视（默认 26mm 视域：量缝宽、数连接件）
     _3_mid_section.png  中层剖（沿墙厚中面切开）：膜边界、缝宽、柱脚
     _4_gap_section.png  跨缝剖（含墙厚）：膜是否居中、楔形最宽是否 ≤ 墙厚 − 线宽
+加 --iso 再出一张 _5_iso.png 整件斜视（--el/--az 调角度，默认 115/-90：
+115 = 从法向再往上抬 25°，能同时看到顶面与墙厚；el<90 是从下方看）。
+量尺寸以 1:1 正投影与剖切为准；斜视只回答"整件长什么样"，不要再另写
+matplotlib Poly3DCollection 出图——那是按面平均深度排序，5mm 厚壁上的
+2.5mm 错位会翻面，画出来像零件碎了。
 
 剖切只用 trimesh.intersections.mesh_plane（不需要 scipy / slice_mesh_plane）。
 """
@@ -147,7 +154,10 @@ def _raster(mesh, h, u, n, el, az, crop=None, px=1600):
             continue
         area = s * (e0 + e1 + e2)
         w0, w1, w2 = s * e0 / area, s * e1 / area, s * e2 / area
-        depth = w0 * fd[0] + w1 * fd[1] + w2 * fd[2]
+        # 注意：e0 是 (P1-P0)×(P-P0)，对应 P2 的对边面积，故权重与顶点是错位对齐的：
+        # w0→fd[2]、w1→fd[0]、w2→fd[1]。写反了在正视下无感（三顶点深度相同），
+        # 但斜视时插值深度会被拧成歪面，出现整片假遮挡碎块。
+        depth = w1 * fd[0] + w2 * fd[1] + w0 * fd[2]
         zz = zbuf[y0:y1 + 1, x0:x1 + 1]
         m = inside & (depth > zz)
         if not m.any():
@@ -264,7 +274,8 @@ def section_2d(mesh, normal_idx, origin, out, aa, bb, crop=None, title=""):
 
 # ---------------- 主流程 ----------------
 
-def preview(stl, out_dir, normal_axis="y", up_axis="z", zoom=None):
+def preview(stl, out_dir, normal_axis="y", up_axis="z", zoom=None,
+            iso=False, iso_el=115.0, iso_az=-90.0):
     os.makedirs(out_dir, exist_ok=True)
     mesh = trimesh.load(stl, force="mesh")
     h, u, n = _frame(normal_axis, up_axis)
@@ -297,6 +308,13 @@ def preview(stl, out_dir, normal_axis="y", up_axis="z", zoom=None):
     p = os.path.join(out_dir, stem + "_4_gap_section.png")
     out.append(section_2d(mesh, h, origin2, p, u, n, crop=(zc, zs),
                           title="跨缝剖（含墙厚）｜膜须居中、楔形最宽 ≤ 墙厚 − 线宽"))
+
+    if iso:
+        p = os.path.join(out_dir, stem + "_5_iso.png")
+        out.append(render_shaded(
+            mesh, p, h, u, n, el=iso_el, az=iso_az,
+            title="整件斜视 el=%.0f° az=%.0f°｜遮挡逐像素判定，墙能挡住膜"
+                  % (iso_el, iso_az)))
     for p in out:
         print("写出", p)
     return out
@@ -309,5 +327,13 @@ if __name__ == "__main__":
     ap.add_argument("--normal", default="y", choices=list(AX))
     ap.add_argument("--up", default="z", choices=list(AX))
     ap.add_argument("--zoom", default=None, help='"cx,cy,cz" 或 "cx,cy,cz,size"')
+    ap.add_argument("--iso", action="store_true", help="额外出一张整件斜视 _5_iso.png")
+    ap.add_argument("--el", type=float, default=None,
+                    help="斜视仰角（0=贴面，90=正对墙法向；给值即隐含 --iso）")
+    ap.add_argument("--az", type=float, default=None,
+                    help="斜视方位角（-90 与正视同侧、左右对称）")
     a = ap.parse_args()
-    preview(a.stl, a.out, a.normal, a.up, a.zoom)
+    preview(a.stl, a.out, a.normal, a.up, a.zoom,
+            iso=(a.iso or a.el is not None or a.az is not None),
+            iso_el=115.0 if a.el is None else a.el,
+            iso_az=-90.0 if a.az is None else a.az)
