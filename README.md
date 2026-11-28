@@ -33,11 +33,8 @@ pip install manifold3d numpy pillow matplotlib
 ```
 
 ## 使用方法
-
-### 方式一：作为 Agent 技能（推荐）
-
+作为 Agent 技能
 把整个目录放进 Agent 的 skills 目录（例如项目的 `.dsh/skills/`、豆包的 `.user_skills/`），然后直接用自然语言下指令，例如"给这个镂空口加薄墙""窗口改成薄壁悬浮、靠连接件拉住""层高 0.08 也要打得出来"。
-
 每次开工需要给定四个参数
 | 参数 | 含义 |
 |---|---|
@@ -45,26 +42,6 @@ pip install manifold3d numpy pillow matplotlib
 | `lw` | 线宽，决定可打印缝宽下限、张开封顶、薄墙片宽 |
 | `skin` | 膜厚 |(0，4喷嘴选0.45，0.2喷嘴选0.4）
 | `up_dir` | 口在平面上哪边朝"打印向上"（决定分区） 把stl文件给进去|
-
-### 方式二：作为 Python 库直接调用
-
-```python
-import sys; sys.path.insert(0, r"<本仓库路径>/scripts")
-import thinwall as tw
-
-spec = tw.WindowSpec(layer=0.08, lw=0.4, skin=0.45, wall=3.0, up=(0, 1))
-rings = [[(25,30),(175,30),(175,260),(25,260)]]   # 外环；有岛再加内环
-
-cut, fill, info = tw.window_poly(rings, 0.0, 3.0, spec=spec, axis="y")
-solid = tw.subtract(solid, cut)
-solid = tw.add(solid, fill)
-
-print(info["warn"])        # 先读告警（窄缝/净跨超标/上缘无柱/起膜边提醒/窄端不放柱）
-print(info["support"])     # 每区柱数、净跨、覆盖率、单颗搭接面积
-print(tw.check(solid))     # 须 closed=True 且 bodies==1
-tw.clean_export(solid, "part.stl")
-```
-
 ## 更多文档
 
 - 结构模型、分区与布点规则、校验清单：见 [SKILL.md](SKILL.md)
